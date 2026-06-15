@@ -45,8 +45,8 @@ def main():
         )
         print(f"[download] DONE {path}")
 
-    gemma_id = os.environ.get("GEMMA_REPO", "google/gemma-3-4b-it")
-    sentinel = GEMMA_DIR / ".downloaded"
+    gemma_id = os.environ.get("GEMMA_REPO", "google/gemma-3-1b-it")
+    sentinel = GEMMA_DIR / f".downloaded_{gemma_id.replace('/', '_')}"
     if not sentinel.exists():
         print(f"[download] ... {gemma_id}")
         snapshot_download(
