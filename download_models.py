@@ -45,7 +45,9 @@ def main():
         )
         print(f"[download] DONE {path}")
 
-    gemma_id = os.environ.get("GEMMA_REPO", "google/gemma-3-1b-it")
+    # LTX-2.3 expects Gemma hidden_size=3840 → that's Gemma 3 12B (4B has 2560, 1B has 1152).
+    # Verified via runtime size_mismatch error from a 4B download attempt.
+    gemma_id = os.environ.get("GEMMA_REPO", "google/gemma-3-12b-it")
     sentinel = GEMMA_DIR / f".downloaded_{gemma_id.replace('/', '_')}"
     if not sentinel.exists():
         print(f"[download] ... {gemma_id}")
