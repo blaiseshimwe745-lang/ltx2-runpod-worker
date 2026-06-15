@@ -1,31 +1,5 @@
 """
 RunPod Serverless worker for LTX-2.3 (DistilledPipeline).
-
-Notes:
-  - The LTX-2 Python API is brand new (no diffusers integration yet). Imports
-    below are best-effort against the public package layout. If the first run
-    fails on an ImportError, paste the traceback back and we'll adjust the
-    import path — the rest of the handler is generic.
-  - Model weights live on the mounted Network Volume at /runpod-volume.
-  - First cold-start downloads weights (~5-8 min); subsequent boots ~10-20s.
-
-Input schema:
-{
-  "input": {
-    "prompt": "...",
-    "image": "<data:image/png;base64,... or https URL>",  # optional, for I2V
-    "width":  768,
-    "height": 512,
-    "duration_seconds": 5.0,
-    "fps": 24,
-    "seed": 12345,
-    "negative_prompt": "",
-    "enhance_prompt": false
-  }
-}
-
-Output:
-{ "video": "data:video/mp4;base64,...", "width": 768, "height": 512, "fps": 24, "frames": 121, "seed_used": 12345 }
 """
 
 import base64
@@ -59,27 +33,31 @@ def _load_pipeline():
         return
     try:
         import torch  # noqa: F401
-        # LTX-2 package import — best-effort.
-        # If this errors, paste the message; we'll fix the import path.
-        try:
-            from ltx_pipelines import DistilledPipeline  # type: ignore
-        except Exception:
-            from ltx_pipelines.distilled_pipeline import DistilledPipeline  # type: ignore
-
-        import torch
+        
+        from ltx_pipelines.distilled import DistilledPipeline
+        from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP
+        
         volume = Path(os.environ.get("VOLUME_PATH", "/runpod-volume"))
         ltx_dir = volume / "ltx-2.3"
         gemma_dir = volume / "gemma-3"
 
         print("[boot] Loading DistilledPipeline…")
-        _pipe = DistilledPipeline.from_pretrained(
-            checkpoint_path=str(ltx_dir / "ltx-2.3-22b-distilled-1.1.safetensors"),
-            spatial_upscaler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
-            distilled_lora_path=str(ltx_dir / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
-            text_encoder_path=str(gemma_dir),
-            dtype=torch.bfloat16,
+        
+        loras = [
+            LoraPathStrengthAndSDOps(
+                path=str(ltx_dir / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
+                strength=1.0,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP
+            )
+        ]
+        
+        _pipe = DistilledPipeline(
+            distilled_checkpoint_path=str(ltx_dir / "ltx-2.3-22b-distilled-1.1.safetensors"),
+            gemma_root=str(gemma_dir),
+            spatial_upsampler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            loras=loras,
+            device=torch.device("cuda"),
         )
-        _pipe = _pipe.to("cuda")
         print("[boot] Pipeline ready.")
     except Exception as e:
         _load_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"
@@ -95,37 +73,26 @@ def _round_frames(n: int) -> int:
     return max(9, ((int(n) - 1) // 8) * 8 + 1)
 
 
-def _decode_input_image(s):
+def _decode_input_image(s, tmp_path):
     if not s:
         return None
     from PIL import Image
     if s.startswith("data:"):
         b64 = s.split(",", 1)[1]
-        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    if s.startswith("http"):
+        im = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    elif s.startswith("http"):
         import urllib.request
         with urllib.request.urlopen(s, timeout=30) as r:
-            return Image.open(io.BytesIO(r.read())).convert("RGB")
-    return None
-
-
-def _frames_to_mp4(frames, fps: int, audio=None) -> bytes:
-    """Encode a list of PIL frames (and optional audio waveform) to MP4 bytes."""
-    import imageio.v3 as iio
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        tmp = f.name
-    try:
-        # Note: audio muxing left as TODO — LTX-2 returns audio too but we keep
-        # this handler video-only on first iteration. Once video works we can
-        # add ffmpeg-based audio mux.
-        iio.imwrite(tmp, frames, fps=fps, codec="libx264", quality=8)
-        return Path(tmp).read_bytes()
-    finally:
-        try: os.unlink(tmp)
-        except Exception: pass
+            im = Image.open(io.BytesIO(r.read())).convert("RGB")
+    else:
+        return None
+    im.save(tmp_path)
+    return tmp_path
 
 
 def handler(event):
+    image_tmp = None
+    output_tmp = None
     try:
         inp = (event or {}).get("input", {}) or {}
         prompt = (inp.get("prompt") or "").strip()
@@ -138,8 +105,6 @@ def handler(event):
         if _load_error:
             return {"error": "pipeline_load_failed", "detail": _load_error}
 
-        import torch
-
         width = _round_dim(inp.get("width", 768))
         height = _round_dim(inp.get("height", 512))
         fps = int(inp.get("fps", 24))
@@ -150,61 +115,57 @@ def handler(event):
             seed = random.randint(0, 2**31 - 1)
         seed = int(seed)
 
-        image = _decode_input_image(inp.get("image"))
-
-        gen = torch.Generator(device="cuda").manual_seed(seed)
-
         call_kwargs = dict(
             prompt=prompt,
             width=width,
             height=height,
             num_frames=num_frames,
-            generator=gen,
-            negative_prompt=inp.get("negative_prompt") or None,
+            frame_rate=float(fps),
+            seed=seed,
+            images=[],
         )
-        if image is not None:
-            call_kwargs["image"] = image
+        
+        image_input_b64 = inp.get("image")
+        if image_input_b64:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                image_tmp = f.name
+            
+            img_path = _decode_input_image(image_input_b64, image_tmp)
+            if img_path:
+                from ltx_pipelines.utils.args import ImageConditioningInput
+                call_kwargs["images"] = [
+                    ImageConditioningInput(
+                        path=img_path,
+                        frame_idx=0,
+                        strength=1.0,
+                    )
+                ]
+            else:
+                try: os.unlink(image_tmp)
+                except Exception: pass
+                image_tmp = None
+
         if inp.get("enhance_prompt"):
             call_kwargs["enhance_prompt"] = True
 
         print(f"[run] {width}x{height} f{num_frames} fps{fps} seed={seed}")
-        out = _pipe(**call_kwargs)
+        
+        video_iter, audio = _pipe(**call_kwargs)
 
-        # Best-effort frame extraction (covers common return shapes)
-        frames = None
-        for attr in ("frames", "video", "videos", "images"):
-            if hasattr(out, attr):
-                v = getattr(out, attr)
-                if v is not None:
-                    frames = v
-                    break
-        if frames is None and isinstance(out, (list, tuple)):
-            frames = out[0]
-
-        if frames is None:
-            return {"error": "no frames in pipeline output", "out_type": type(out).__name__}
-
-        # If frames is a tensor (T,C,H,W) or (B,T,C,H,W), convert
-        if hasattr(frames, "detach"):
-            t = frames.detach().to("cpu")
-            if t.dim() == 5:
-                t = t[0]
-            # (T,C,H,W) -> (T,H,W,C) uint8
-            t = (t.clamp(-1, 1) + 1) / 2 if t.min() < 0 else t.clamp(0, 1)
-            t = (t.permute(0, 2, 3, 1).numpy() * 255).astype("uint8")
-            frames_np = t
-        else:
-            # Assume list of PIL Images
-            import numpy as np
-            frames_np = [
-                (f if isinstance(f, (bytes, bytearray)) else
-                 (f if hasattr(f, "shape") else
-                  (lambda im: np.array(im.convert("RGB")))(f)))
-                for f in frames
-            ]
-
-        mp4 = _frames_to_mp4(frames_np, fps=fps)
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            output_tmp = f.name
+            
+        from ltx_pipelines.utils.media_io import encode_video
+        encode_video(
+            video=video_iter,
+            fps=fps,
+            audio=audio,
+            output_path=output_tmp,
+        )
+        
+        mp4 = Path(output_tmp).read_bytes()
         b64 = base64.b64encode(mp4).decode("ascii")
+        
         return {
             "video": f"data:video/mp4;base64,{b64}",
             "width": width,
@@ -219,6 +180,13 @@ def handler(event):
             "error": f"{type(e).__name__}: {e}",
             "trace": traceback.format_exc()[-3000:],
         }
+    finally:
+        if image_tmp:
+            try: os.unlink(image_tmp)
+            except Exception: pass
+        if output_tmp:
+            try: os.unlink(output_tmp)
+            except Exception: pass
 
 
 runpod.serverless.start({"handler": handler})

@@ -24,7 +24,7 @@ RUN /root/.local/bin/uv sync --frozen || /root/.local/bin/uv sync
 # ---- our extras into the same venv ----
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-RUN /opt/LTX-2/.venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+RUN /root/.local/bin/uv pip install --python /opt/LTX-2/.venv/bin/python --no-cache-dir -r /app/requirements.txt
 
 # ---- handler + downloader ----
 COPY download_models.py /app/download_models.py
