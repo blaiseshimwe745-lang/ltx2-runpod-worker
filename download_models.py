@@ -144,13 +144,19 @@ def consolidate_gemma():
     merged = {}
     for sh in shards:
         d = load_file(str(sh))
-        merged.update(d)
+        # Clone tensors to RAM to drop mmap references
+        for k, v in d.items():
+            merged[k] = v.clone()
         del d
+        # Delete shard from disk immediately to stay under 100GB limit
+        sh.unlink(missing_ok=True)
+        print(f"[consolidate] loaded and deleted {sh.name}")
+        
+    (GEMMA_DIR / "model.safetensors.index.json").unlink(missing_ok=True)
+    
+    print(f"[consolidate] writing single model.safetensors to disk...")
     save_file(merged, str(single))
     del merged
-    for sh in shards:
-        sh.unlink(missing_ok=True)
-    (GEMMA_DIR / "model.safetensors.index.json").unlink(missing_ok=True)
     print(f"[consolidate] done: {single.stat().st_size/1e9:.1f} GB single file")
 
 
