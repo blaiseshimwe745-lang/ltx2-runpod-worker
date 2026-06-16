@@ -14,6 +14,8 @@ from pathlib import Path
 
 import runpod
 
+sys.path.insert(0, "/app")  # so `import download_models` works in diagnostic mode
+
 # ---- Boot: make sure models are on the volume ----
 print("[boot] checking models on volume…")
 try:
@@ -95,6 +97,23 @@ def handler(event):
     output_tmp = None
     try:
         inp = (event or {}).get("input", {}) or {}
+
+        # --- Diagnostic / repair mode: inspect the network volume directly ---
+        if inp.get("diagnostic"):
+            import download_models as dm
+            info = dm.diagnose()
+            if inp.get("repair"):
+                # Force a clean Gemma 12B re-download and report the result
+                try:
+                    dm.main(force_gemma=True)
+                    info["repair"] = "ok"
+                    info["gemma_hidden_size_after"] = dm.diagnose().get("gemma_hidden_size")
+                except SystemExit as se:
+                    info["repair"] = f"exit {se.code}"
+                except Exception as e:
+                    info["repair"] = f"error: {e}"
+            return info
+
         prompt = (inp.get("prompt") or "").strip()
         if not prompt:
             return {"error": "missing 'prompt'"}
