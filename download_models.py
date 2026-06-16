@@ -95,10 +95,44 @@ def diagnose():
     return info
 
 
+def clean_mixed_gemma_shards():
+    """Remove safetensors that don't belong to the 12B model + stale sentinels.
+
+    Root cause of the recurring failure: the gemma dir accumulated shards from
+    MULTIPLE variants (4B = *-of-00002, 12B = *-of-00005). LTX globs all
+    *.safetensors and crashes on the dimension mismatch. We keep only the files
+    referenced by the current model.safetensors.index.json (the 12B set).
+    """
+    import re
+    index = GEMMA_DIR / "model.safetensors.index.json"
+    valid = set()
+    if index.exists():
+        try:
+            data = json.loads(index.read_text())
+            valid = set(data.get("weight_map", {}).values())
+            print(f"[clean] 12B index lists {len(valid)} shard files: {sorted(valid)}")
+        except Exception as e:
+            print(f"[clean] could not parse index: {e}")
+
+    removed = []
+    for f in GEMMA_DIR.glob("*.safetensors"):
+        if valid and f.name not in valid:
+            f.unlink(missing_ok=True)
+            removed.append(f.name)
+    # stale sentinels
+    for s in GEMMA_DIR.glob(".downloaded*"):
+        s.unlink(missing_ok=True)
+        removed.append(s.name)
+    print(f"[clean] removed {len(removed)}: {removed}")
+    return removed
+
+
 def main(force_gemma=False):
     print(f"[download] Volume: {VOLUME}")
     token = _hf_token()
     print(f"[download] HF token present: {bool(token)} (len={len(token) if token else 0})")
+    if force_gemma:
+        clean_mixed_gemma_shards()
 
     # ---- LTX-2.3 weights ----
     for fname in LTX_FILES:
@@ -116,23 +150,28 @@ def main(force_gemma=False):
 
     needs_download = force_gemma or hs != REQUIRED_HIDDEN_SIZE
     if needs_download:
-        print(f"[download] wiping {GEMMA_DIR} (wrong/missing gemma)")
-        _wipe_dir(GEMMA_DIR)
-        GEMMA_DIR.mkdir(parents=True, exist_ok=True)
+        # If config says wrong variant AND we're not in surgical-clean mode, full wipe.
+        # In force mode we already cleaned mixed shards surgically — just complete 12B.
+        if not force_gemma and hs not in (None, REQUIRED_HIDDEN_SIZE):
+            print(f"[download] full wipe {GEMMA_DIR} (wrong variant {hs})")
+            _wipe_dir(GEMMA_DIR)
+            GEMMA_DIR.mkdir(parents=True, exist_ok=True)
         if not token:
             print(f"[download] FATAL: HF token required for gated {GEMMA_REPO}", file=sys.stderr)
             sys.exit(2)
-        print(f"[download] ... {GEMMA_REPO} (~24 GB, several minutes)")
+        print(f"[download] ... completing {GEMMA_REPO} (resumes existing shards)")
         snapshot_download(
             repo_id=GEMMA_REPO,
             local_dir=str(GEMMA_DIR),
             allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors", "*.safetensors.index.json", "*.py"],
             token=token,
         )
+        # After download, clean any leftover non-12B shards again (belt & suspenders)
+        clean_mixed_gemma_shards()
         hs2 = _gemma_hidden_size_on_disk()
         print(f"[download] post-download Gemma hidden_size: {hs2}")
         if hs2 != REQUIRED_HIDDEN_SIZE:
-            print(f"[download] FATAL: downloaded gemma hidden_size {hs2} != {REQUIRED_HIDDEN_SIZE}", file=sys.stderr)
+            print(f"[download] FATAL: gemma hidden_size {hs2} != {REQUIRED_HIDDEN_SIZE}", file=sys.stderr)
             sys.exit(3)
         print("[download] DONE Gemma 12B verified")
     else:
