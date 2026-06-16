@@ -127,6 +127,33 @@ def clean_mixed_gemma_shards():
     return removed
 
 
+def consolidate_gemma():
+    """LTX's loader opens a SINGLE gemma-3/model.safetensors. The HF 12B download
+    is sharded (model-0000X-of-00005). Merge the shards into one file and drop
+    the shards + index so the loader finds exactly one model.safetensors."""
+    from safetensors.torch import load_file, save_file
+    single = GEMMA_DIR / "model.safetensors"
+    shards = sorted(GEMMA_DIR.glob("model-*-of-*.safetensors"))
+    if single.exists() and not shards:
+        print("[consolidate] already a single model.safetensors")
+        return
+    if not shards:
+        print("[consolidate] no shards found, nothing to merge")
+        return
+    print(f"[consolidate] merging {len(shards)} shards into model.safetensors ...")
+    merged = {}
+    for sh in shards:
+        d = load_file(str(sh))
+        merged.update(d)
+        del d
+    save_file(merged, str(single))
+    del merged
+    for sh in shards:
+        sh.unlink(missing_ok=True)
+    (GEMMA_DIR / "model.safetensors.index.json").unlink(missing_ok=True)
+    print(f"[consolidate] done: {single.stat().st_size/1e9:.1f} GB single file")
+
+
 def main(force_gemma=False):
     print(f"[download] Volume: {VOLUME}")
     token = _hf_token()
@@ -176,6 +203,9 @@ def main(force_gemma=False):
         print("[download] DONE Gemma 12B verified")
     else:
         print("[download] OK  Gemma 12B already correct")
+
+    # LTX wants a single model.safetensors — merge shards if needed
+    consolidate_gemma()
 
     print("[download] all models ready")
 
