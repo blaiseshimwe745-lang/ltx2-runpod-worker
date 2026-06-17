@@ -34,7 +34,11 @@ def _load_pipeline():
     if _pipe is not None or _load_error is not None:
         return
     try:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         import torch  # noqa: F401
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.cuda.empty_cache()
         
         from ltx_pipelines.distilled import DistilledPipeline
         from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP
@@ -59,6 +63,7 @@ def _load_pipeline():
             spatial_upsampler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
             loras=loras,
             device=torch.device("cuda"),
+            dtype=torch.bfloat16,
         )
         print("[boot] Pipeline ready.")
     except Exception as e:
@@ -168,6 +173,9 @@ def handler(event):
             call_kwargs["enhance_prompt"] = True
 
         print(f"[run] {width}x{height} f{num_frames} fps{fps} seed={seed}")
+        
+        import torch
+        torch.cuda.empty_cache()
         
         video_iter, audio = _pipe(**call_kwargs)
 
