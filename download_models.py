@@ -27,10 +27,13 @@ GEMMA_REPO = os.environ.get("GEMMA_REPO", "google/gemma-3-12b-it")
 REQUIRED_HIDDEN_SIZE = 3840  # Gemma 3 12B
 
 LTX_FILES = [
-    "ltx-2.3-22b-distilled-1.1.safetensors",
+    "ltx-2.3-22b-dev.safetensors",                      # full dev model (quality)
     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-    "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+    "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",   # used in stage-2 refine
 ]
+
+# Free space: the dev model replaces distilled — remove the distilled checkpoint
+LTX_OBSOLETE = ["ltx-2.3-22b-distilled-1.1.safetensors"]
 
 
 def have(path: Path) -> bool:
@@ -127,6 +130,21 @@ def clean_mixed_gemma_shards():
     return removed
 
 
+def single_gemma_is_valid():
+    """True if model.safetensors exists and its header is readable (not truncated)."""
+    single = GEMMA_DIR / "model.safetensors"
+    if not single.exists():
+        return False
+    try:
+        import safetensors
+        with safetensors.safe_open(str(single), framework="pt") as f:
+            _ = f.keys()
+        return True
+    except Exception as e:
+        print(f"[gemma] existing model.safetensors invalid (truncated?): {e}")
+        return False
+
+
 def consolidate_gemma():
     """LTX's loader opens a SINGLE gemma-3/model.safetensors. The HF 12B download
     is sharded (model-0000X-of-00005). Merge the shards into one file and drop
@@ -134,12 +152,13 @@ def consolidate_gemma():
     from safetensors.torch import load_file, save_file
     single = GEMMA_DIR / "model.safetensors"
     shards = sorted(GEMMA_DIR.glob("model-*-of-*.safetensors"))
-    if single.exists() and not shards:
-        print("[consolidate] already a single model.safetensors")
-        return
     if not shards:
-        print("[consolidate] no shards found, nothing to merge")
-        return
+        if single_gemma_is_valid():
+            print("[consolidate] already a valid single model.safetensors")
+            return
+        raise FileNotFoundError("no gemma shards and single is missing/invalid")
+    # Drop a stale/truncated single before merging fresh shards
+    single.unlink(missing_ok=True)
     print(f"[consolidate] merging {len(shards)} shards into model.safetensors ...")
     merged = {}
     for sh in shards:
@@ -167,6 +186,13 @@ def main(force_gemma=False):
     if force_gemma:
         clean_mixed_gemma_shards()
 
+    # ---- Free disk: remove obsolete distilled checkpoint before downloading dev ----
+    for obs in LTX_OBSOLETE:
+        p = LTX_DIR / obs
+        if p.exists():
+            print(f"[download] removing obsolete {obs} to free disk")
+            p.unlink(missing_ok=True)
+
     # ---- LTX-2.3 weights ----
     for fname in LTX_FILES:
         out = LTX_DIR / fname
@@ -177,12 +203,20 @@ def main(force_gemma=False):
         path = hf_hub_download(repo_id=LTX_REPO, filename=fname, local_dir=str(LTX_DIR), token=token)
         print(f"[download] DONE {path}")
 
-    # ---- Gemma: verify by config, not by sentinel ----
+    # ---- Gemma: verify by config + actual file validity ----
     hs = _gemma_hidden_size_on_disk()
-    print(f"[download] Gemma hidden_size on disk: {hs} (need {REQUIRED_HIDDEN_SIZE})")
+    shards_present = bool(sorted(GEMMA_DIR.glob("model-*-of-*.safetensors")))
+    single_ok = single_gemma_is_valid()
+    print(f"[download] Gemma hs={hs} (need {REQUIRED_HIDDEN_SIZE}) shards={shards_present} single_ok={single_ok}")
 
-    needs_download = force_gemma or hs != REQUIRED_HIDDEN_SIZE
+    gemma_ready = (hs == REQUIRED_HIDDEN_SIZE) and (single_ok or shards_present)
+    needs_download = force_gemma or not gemma_ready
     if needs_download:
+        # Delete a truncated/invalid single BEFORE downloading shards, else the
+        # 100GB volume overflows (LTX 55GB + bad single 24GB + new shards 24GB).
+        if not single_ok:
+            (GEMMA_DIR / "model.safetensors").unlink(missing_ok=True)
+            print("[download] removed stale/invalid single model.safetensors")
         # If config says wrong variant AND we're not in surgical-clean mode, full wipe.
         # In force mode we already cleaned mixed shards surgically — just complete 12B.
         if not force_gemma and hs not in (None, REQUIRED_HIDDEN_SIZE):

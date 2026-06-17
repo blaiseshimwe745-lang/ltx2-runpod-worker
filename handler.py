@@ -47,38 +47,41 @@ def _load_pipeline():
         torch.set_default_dtype(torch.bfloat16)
         torch.cuda.empty_cache()
         
-        from ltx_pipelines.distilled import DistilledPipeline
+        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
         from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP
-        
+
         volume = Path(os.environ.get("VOLUME_PATH", "/runpod-volume"))
         ltx_dir = volume / "ltx-2.3"
         gemma_dir = volume / "gemma-3"
 
-        print("[boot] Loading DistilledPipeline…")
-        
-        loras = [
+        print("[boot] Loading TI2VidTwoStagesPipeline (full dev model)…")
+
+        # Stage 2 of the dev pipeline still uses the distilled LoRA for the refine step
+        distilled_lora = [
             LoraPathStrengthAndSDOps(
                 path=str(ltx_dir / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
                 strength=1.0,
-                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
             )
         ]
-        
-        _pipe = DistilledPipeline(
-            distilled_checkpoint_path=str(ltx_dir / "ltx-2.3-22b-distilled-1.1.safetensors"),
-            gemma_root=str(gemma_dir),
+
+        _pipe = TI2VidTwoStagesPipeline(
+            checkpoint_path=str(ltx_dir / "ltx-2.3-22b-dev.safetensors"),
+            distilled_lora=distilled_lora,
             spatial_upsampler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
-            loras=loras,
+            gemma_root=str(gemma_dir),
+            loras=(),
             device=torch.device("cuda"),
         )
-        print("[boot] Pipeline ready.")
+        print("[boot] Pipeline ready (dev / two-stage).")
     except Exception as e:
         _load_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"
         print(f"[boot] Pipeline load failed: {_load_error}", file=sys.stderr)
 
 
 def _round_dim(x: int) -> int:
-    return max(256, (int(x) // 32) * 32)
+    # Two-stage pipeline requires multiples of 64
+    return max(256, (int(x) // 64) * 64)
 
 
 def _round_frames(n: int) -> int:
@@ -145,16 +148,30 @@ def handler(event):
             seed = random.randint(0, 2**31 - 1)
         seed = int(seed)
 
+        from ltx_core.components.guiders import MultiModalGuiderParams
+        from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT
+
+        steps = int(inp.get("num_inference_steps", 30))  # dev default
         call_kwargs = dict(
             prompt=prompt,
+            negative_prompt=inp.get("negative_prompt") or DEFAULT_NEGATIVE_PROMPT,
             width=width,
             height=height,
             num_frames=num_frames,
             frame_rate=float(fps),
+            num_inference_steps=steps,
             seed=seed,
             images=[],
+            video_guider_params=MultiModalGuiderParams(
+                cfg_scale=3.0, stg_scale=1.0, rescale_scale=0.7,
+                modality_scale=3.0, skip_step=0, stg_blocks=[28],
+            ),
+            audio_guider_params=MultiModalGuiderParams(
+                cfg_scale=7.0, stg_scale=1.0, rescale_scale=0.7,
+                modality_scale=3.0, skip_step=0, stg_blocks=[28],
+            ),
         )
-        
+
         image_input_b64 = inp.get("image")
         if image_input_b64:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
