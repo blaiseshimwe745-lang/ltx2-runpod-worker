@@ -38,6 +38,7 @@ def _load_pipeline():
         import torch  # noqa: F401
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_default_dtype(torch.bfloat16)
         torch.cuda.empty_cache()
         
         from ltx_pipelines.distilled import DistilledPipeline
@@ -63,7 +64,6 @@ def _load_pipeline():
             spatial_upsampler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
             loras=loras,
             device=torch.device("cuda"),
-            dtype=torch.bfloat16,
         )
         print("[boot] Pipeline ready.")
     except Exception as e:
