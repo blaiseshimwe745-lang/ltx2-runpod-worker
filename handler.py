@@ -1,7 +1,3 @@
-"""
-RunPod Serverless worker for LTX-2.3 (DistilledPipeline).
-"""
-
 import base64
 import io
 import os
@@ -14,20 +10,16 @@ from pathlib import Path
 
 import runpod
 
-sys.path.insert(0, "/app")  # so `import download_models` works in diagnostic mode
+sys.path.insert(0, "/app")
 
-# ---- Boot: make sure models are on the volume ----
 print("[boot] checking models on volume…")
 try:
     subprocess.check_call([sys.executable, "/app/download_models.py"])
 except Exception as e:
     print(f"[boot] download_models.py failed: {e}", file=sys.stderr)
-    # Don't crash — handler returns the error on first invocation.
 
-# ---- Imports (deferred so the handler can return a clean error message) ----
 _pipe = None
 _load_error = None
-
 
 def _load_pipeline():
     global _pipe, _load_error
@@ -35,56 +27,29 @@ def _load_pipeline():
         return
     try:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        import torch  # noqa: F401
+        import torch
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
-        except Exception:
-            pass
-        torch.set_default_dtype(torch.bfloat16)
-        torch.cuda.empty_cache()
         
-        from ltx_pipelines.distilled import DistilledPipeline
-        from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP
+        from diffusers import WanAnimatePipeline
         
         volume = Path(os.environ.get("VOLUME_PATH", "/runpod-volume"))
-        ltx_dir = volume / "ltx-2.3"
-        gemma_dir = volume / "gemma-3"
+        wan_dir = volume / "wan2-animate-14b-diffusers"
 
-        print("[boot] Loading DistilledPipeline…")
+        print("[boot] Loading WanAnimatePipeline…")
         
-        loras = [
-            LoraPathStrengthAndSDOps(
-                path=str(ltx_dir / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
-                strength=1.0,
-                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP
-            )
-        ]
-        
-        _pipe = DistilledPipeline(
-            distilled_checkpoint_path=str(ltx_dir / "ltx-2.3-22b-distilled-1.1.safetensors"),
-            gemma_root=str(gemma_dir),
-            spatial_upsampler_path=str(ltx_dir / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
-            loras=loras,
-            device=torch.device("cuda"),
+        _pipe = WanAnimatePipeline.from_pretrained(
+            str(wan_dir),
+            torch_dtype=torch.bfloat16
         )
+        
+        # Save memory on 96GB GPU
+        _pipe.enable_model_cpu_offload()
+        
         print("[boot] Pipeline ready.")
     except Exception as e:
         _load_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"
         print(f"[boot] Pipeline load failed: {_load_error}", file=sys.stderr)
-
-
-def _round_dim(x: int) -> int:
-    return max(256, (int(x) // 32) * 32)
-
-
-def _round_frames(n: int) -> int:
-    # Must be 8N + 1
-    return max(9, ((int(n) - 1) // 8) * 8 + 1)
-
 
 def _decode_input_image(s, tmp_path):
     if not s:
@@ -93,120 +58,92 @@ def _decode_input_image(s, tmp_path):
     if s.startswith("data:"):
         b64 = s.split(",", 1)[1]
         im = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    elif s.startswith("http"):
-        import urllib.request
-        with urllib.request.urlopen(s, timeout=30) as r:
-            im = Image.open(io.BytesIO(r.read())).convert("RGB")
     else:
         return None
     im.save(tmp_path)
     return tmp_path
 
+def _decode_input_video(s, tmp_path):
+    if not s:
+        return None
+    if s.startswith("data:"):
+        b64 = s.split(",", 1)[1]
+        with open(tmp_path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        return tmp_path
+    return None
 
 def handler(event):
     image_tmp = None
+    pose_tmp = None
     output_tmp = None
     try:
         inp = (event or {}).get("input", {}) or {}
 
-        # --- Diagnostic / repair mode: inspect the network volume directly ---
         if inp.get("diagnostic"):
             import download_models as dm
-            info = dm.diagnose()
-            if inp.get("repair"):
-                # Force a clean Gemma 12B re-download and report the result
-                try:
-                    dm.main(force_gemma=True)
-                    info["repair"] = "ok"
-                    info["gemma_hidden_size_after"] = dm.diagnose().get("gemma_hidden_size")
-                except SystemExit as se:
-                    info["repair"] = f"exit {se.code}"
-                except Exception as e:
-                    info["repair"] = f"error: {e}"
-            return info
+            return dm.diagnose()
 
         prompt = (inp.get("prompt") or "").strip()
-        if not prompt:
-            return {"error": "missing 'prompt'"}
-
-        # Lazy-load pipeline
+        mode = inp.get("mode", "animate") # "animate" or "replace"
+        
         if _pipe is None:
             _load_pipeline()
         if _load_error:
             return {"error": "pipeline_load_failed", "detail": _load_error}
 
-        width = _round_dim(inp.get("width", 768))
-        height = _round_dim(inp.get("height", 512))
-        fps = int(inp.get("fps", 24))
-        duration = float(inp.get("duration_seconds", 5.0))
-        num_frames = _round_frames(int(duration * fps))
         seed = inp.get("seed")
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         seed = int(seed)
 
-        call_kwargs = dict(
-            prompt=prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            frame_rate=float(fps),
-            seed=seed,
-            images=[],
-        )
-        
         image_input_b64 = inp.get("image")
-        if image_input_b64:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                image_tmp = f.name
-            
-            img_path = _decode_input_image(image_input_b64, image_tmp)
-            if img_path:
-                from ltx_pipelines.utils.args import ImageConditioningInput
-                call_kwargs["images"] = [
-                    ImageConditioningInput(
-                        path=img_path,
-                        frame_idx=0,
-                        strength=1.0,
-                    )
-                ]
-            else:
-                try: os.unlink(image_tmp)
-                except Exception: pass
-                image_tmp = None
-
-        if inp.get("enhance_prompt"):
-            call_kwargs["enhance_prompt"] = True
-
-        print(f"[run] {width}x{height} f{num_frames} fps{fps} seed={seed}")
+        pose_input_b64 = inp.get("pose_video")
         
+        if not image_input_b64 or not pose_input_b64:
+            return {"error": "Both 'image' and 'pose_video' are required for Wan-Animate"}
+
+        from diffusers.utils import load_image, load_video, export_to_video
         import torch
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            image_tmp = f.name
+        _decode_input_image(image_input_b64, image_tmp)
+        ref_image = load_image(image_tmp)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            pose_tmp = f.name
+        _decode_input_video(pose_input_b64, pose_tmp)
+        pose_video = load_video(pose_tmp)
+
+        print(f"[run] mode={mode} seed={seed} prompt={prompt}")
+        
         torch.cuda.empty_cache()
         
-        with torch.inference_mode():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                video_iter, audio = _pipe(**call_kwargs)
+        # We don't use inference_mode() explicitly here because diffusers pipelines usually handle it correctly
+        video_frames = _pipe(
+            image=ref_image,
+            pose_video=pose_video,
+            face_video=pose_video, # Fallback face_video to pose_video
+            prompt=prompt,
+            mode=mode,
+            segment_frame_length=77,
+            prev_segment_conditioning_frames=1,
+            guidance_scale=1.0,
+            num_inference_steps=20,
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+        ).frames[0]
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
             output_tmp = f.name
             
-        from ltx_pipelines.utils.media_io import encode_video
-        encode_video(
-            video=video_iter,
-            fps=fps,
-            audio=audio,
-            output_path=output_tmp,
-        )
+        export_to_video(video_frames, output_tmp, fps=24)
         
         mp4 = Path(output_tmp).read_bytes()
         b64 = base64.b64encode(mp4).decode("ascii")
         
         return {
             "video": f"data:video/mp4;base64,{b64}",
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "frames": num_frames,
             "seed_used": seed,
             "size_bytes": len(mp4),
         }
@@ -219,9 +156,11 @@ def handler(event):
         if image_tmp:
             try: os.unlink(image_tmp)
             except Exception: pass
+        if pose_tmp:
+            try: os.unlink(pose_tmp)
+            except Exception: pass
         if output_tmp:
             try: os.unlink(output_tmp)
             except Exception: pass
-
 
 runpod.serverless.start({"handler": handler})
