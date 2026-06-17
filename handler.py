@@ -187,22 +187,22 @@ def handler(event):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 video_iter, audio = _pipe(**call_kwargs)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            output_tmp = f.name
-            
-        from ltx_pipelines.utils.media_io import encode_video
-        from ltx_core.model.video_vae import get_video_chunks_number, TilingConfig
-        
-        tiling_config = getattr(_pipe, "tiling_config", None) or TilingConfig.default()
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
-        
-        encode_video(
-            video=video_iter,
-            fps=fps,
-            audio=audio,
-            output_path=output_tmp,
-            video_chunks_number=video_chunks_number,
-        )
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    output_tmp = f.name
+                    
+                from ltx_pipelines.utils.media_io import encode_video
+                from ltx_core.model.video_vae import get_video_chunks_number, TilingConfig
+                
+                tiling_config = getattr(_pipe, "tiling_config", None) or TilingConfig.default()
+                video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+                
+                encode_video(
+                    video=video_iter,
+                    fps=fps,
+                    audio=audio,
+                    output_path=output_tmp,
+                    video_chunks_number=video_chunks_number,
+                )
         
         mp4 = Path(output_tmp).read_bytes()
         b64 = base64.b64encode(mp4).decode("ascii")
