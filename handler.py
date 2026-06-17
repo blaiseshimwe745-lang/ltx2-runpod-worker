@@ -38,6 +38,12 @@ def _load_pipeline():
         import torch  # noqa: F401
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)
+        except Exception:
+            pass
         torch.set_default_dtype(torch.bfloat16)
         torch.cuda.empty_cache()
         
@@ -177,7 +183,9 @@ def handler(event):
         import torch
         torch.cuda.empty_cache()
         
-        video_iter, audio = _pipe(**call_kwargs)
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                video_iter, audio = _pipe(**call_kwargs)
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
             output_tmp = f.name
